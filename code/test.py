@@ -33,6 +33,11 @@ if __name__ == '__main__':
     test_save_path = f'./logs/{args.exp}/predictions_{args.cps}/'
     maybe_mkdir(test_save_path)
 
+    #    ADD: Determine if we need return_dict based on experiment type   
+    # For experiments using the modified VNet with noise head, use return_dict=False for testing
+    # For original experiments, use the default behavior
+    use_return_dict = False  # Default to False for testing compatibility
+
     if "fully" in args.exp:
         model = VNet(
             n_channels=config.num_channels,
@@ -43,7 +48,7 @@ if __name__ == '__main__':
         ).cuda()
         model.eval()
         args.cps = None
-
+        use_return_dict = False  # Standard VNet
 
     elif "dst" in args.exp:
         model_A = VNet_Decoupled(
@@ -62,15 +67,13 @@ if __name__ == '__main__':
         ).cuda()
         model_A.eval()
         model_B.eval()
+        use_return_dict = False  # VNet_Decoupled doesn't have noise head
 
     elif "urpc" in args.exp:
         model = unet_3D_ds(n_classes=config.num_cls, in_channels=1).cuda()
         model.eval()
         args.cps = None
-    # elif "acisis" in args.exp:
-    #     model = unet_3D(n_classes=config.num_cls, in_channels=1).cuda()
-    #     model.eval()
-    #     args.cps = None
+        use_return_dict = False  # UNet
 
     elif "uamt" in args.exp or "acisis" in args.exp:
         model = VNet(
@@ -82,6 +85,8 @@ if __name__ == '__main__':
         ).cuda()
         model.eval()
         args.cps = None
+        use_return_dict = False  # Standard VNet
+
     elif "ssnet" in args.exp:
         model = VNet4SSNet(
             n_channels=config.num_channels,
@@ -91,6 +96,7 @@ if __name__ == '__main__':
             has_dropout=False).cuda()
         model.eval()
         args.cps = None
+        use_return_dict = False  # VNet4SSNet in eval mode returns tensors
 
     elif "unetrpp" in args.exp:
         model_A = UNETR_PP(
@@ -109,8 +115,10 @@ if __name__ == '__main__':
         ).cuda()
         model_A.eval()
         model_B.eval()
+        use_return_dict = False  # UNETR_PP returns tensors
 
     else:
+        # Default case for DHC and other semi-supervised methods
         model_A = VNet(
             n_channels=config.num_channels,
             n_classes=config.num_cls,
@@ -127,17 +135,18 @@ if __name__ == '__main__':
         ).cuda()
         model_A.eval()
         model_B.eval()
-
+        # For DHC with modified VNet, we need return_dict=False since models return dicts by default
+        use_return_dict = True  # Modified VNet returns dictionaries
 
     ckpt_path = os.path.join(snapshot_path, f'ckpts/best_model.pth')
-
-
 
     with torch.no_grad():
         if args.cps == "AB":
             model_A.load_state_dict(torch.load(ckpt_path)["A"])
             model_B.load_state_dict(torch.load(ckpt_path)["B"])
             print(f'load checkpoint from {ckpt_path}')
+            print(f'Using return_dict={use_return_dict} for testing')
+            
             test_all_case_AB(
                 model_A, model_B,
                 read_list(args.split, task=args.task),
@@ -146,7 +155,8 @@ if __name__ == '__main__':
                 patch_size=config.patch_size,
                 stride_xy=stride[0],
                 stride_z=stride[1],
-                test_save_path=test_save_path
+                test_save_path=test_save_path,
+                return_dict=use_return_dict  #    PASS the parameter   
             )
         else:
             if args.cps:
@@ -154,6 +164,8 @@ if __name__ == '__main__':
             else: # for full-supervision
                 model.load_state_dict(torch.load(ckpt_path))
             print(f'load checkpoint from {ckpt_path}')
+            print(f'Using return_dict={use_return_dict} for testing')
+            
             test_all_case(
                 model,
                 read_list(args.split, task=args.task),
@@ -162,5 +174,6 @@ if __name__ == '__main__':
                 patch_size=config.patch_size,
                 stride_xy=stride[0],
                 stride_z=stride[1],
-                test_save_path=test_save_path
+                test_save_path=test_save_path,
+                return_dict=use_return_dict  #    PASS the parameter   
             )

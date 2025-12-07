@@ -116,7 +116,7 @@ def fetch_data(batch, labeled=True):
         return image
 
 
-def test_all_case(net, ids_list, task, num_classes, patch_size, stride_xy, stride_z, test_save_path=None):
+def test_all_case(net, ids_list, task, num_classes, patch_size, stride_xy, stride_z, test_save_path=None, return_dict=False):
     for data_id in tqdm(ids_list):
         image, _ = read_data(data_id, task, test=True, normalize=True)
         pred, _ = test_single_case(
@@ -125,13 +125,14 @@ def test_all_case(net, ids_list, task, num_classes, patch_size, stride_xy, strid
             stride_xy,
             stride_z,
             patch_size,
-            num_classes=num_classes
+            num_classes=num_classes,
+            return_dict=return_dict
         )
         out = sitk.GetImageFromArray(pred.astype(np.float32))
         sitk.WriteImage(out, f'{test_save_path}/{data_id}.nii.gz')
 
 
-def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes):
+def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes, return_dict=False):
     image = image[np.newaxis]
     _, dd, ww, hh = image.shape
     # print(image.shape)
@@ -168,7 +169,15 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes):
                 # print("===",test_patch.size())
                 # <-- [1, 1, Z, Y, X] => [1, 1, X, Y, Z]
                 test_patch = test_patch.transpose(2, 4)
-                y1 = net(test_patch) # <--
+                
+                if return_dict:
+                    # For models that return dictionaries, extract seg_logits
+                    output_dict = net(test_patch)
+                    y1 = output_dict['seg_logits']
+                else:
+                    # For models that return tensors directly
+                    y1 = net(test_patch)
+                
                 y = F.softmax(y1, dim=1) # <--
                 y = y.cpu().data.numpy()
                 y = y[0, ...]
@@ -185,7 +194,7 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes):
 
 
 
-def test_all_case_AB(net_A, net_B, ids_list, task, num_classes, patch_size, stride_xy, stride_z, test_save_path=None):
+def test_all_case_AB(net_A, net_B, ids_list, task, num_classes, patch_size, stride_xy, stride_z, test_save_path=None, return_dict=False):
     for data_id in tqdm(ids_list):
         image, _ = read_data(data_id, task, test=True, normalize=True)
         if task == "synapse":
@@ -195,7 +204,8 @@ def test_all_case_AB(net_A, net_B, ids_list, task, num_classes, patch_size, stri
                 stride_xy,
                 stride_z,
                 patch_size,
-                num_classes=num_classes
+                num_classes=num_classes,
+                return_dict=return_dict
             )
         else:
             pred, _ = test_single_case_AB(
@@ -204,14 +214,15 @@ def test_all_case_AB(net_A, net_B, ids_list, task, num_classes, patch_size, stri
                 stride_xy,
                 stride_z,
                 patch_size,
-                num_classes=num_classes
+                num_classes=num_classes,
+                return_dict=return_dict
             )
         out = sitk.GetImageFromArray(pred.astype(np.float32))
 
         sitk.WriteImage(out, f'{test_save_path}/{data_id}.nii.gz')
 
 
-def test_single_case_AB_synapse(net_A, net_B, image, stride_xy, stride_z, patch_size, num_classes):
+def test_single_case_AB_synapse(net_A, net_B, image, stride_xy, stride_z, patch_size, num_classes, return_dict=False):
     image = image[np.newaxis]
     _, dd, ww, hh = image.shape
     # print(image.shape)
@@ -245,7 +256,16 @@ def test_single_case_AB_synapse(net_A, net_B, image, stride_xy, stride_z, patch_
                 # print("===",test_patch.size())
                 # <-- [1, 1, Z, Y, X] => [1, 1, X, Y, Z]
                 test_patch = test_patch.transpose(2, 4)
-                y1 = (net_A(test_patch) + net_B(test_patch)) / 2.0 # <--
+                
+                if return_dict:
+                    # For models that return dictionaries, extract seg_logits
+                    output_A = net_A(test_patch)
+                    output_B = net_B(test_patch)
+                    y1 = (output_A['seg_logits'] + output_B['seg_logits']) / 2.0
+                else:
+                    # For models that return tensors directly
+                    y1 = (net_A(test_patch) + net_B(test_patch)) / 2.0
+                
                 y = F.softmax(y1, dim=1) # <--
                 y = y.cpu().data.numpy()
                 y = y[0, ...]
@@ -262,7 +282,7 @@ def test_single_case_AB_synapse(net_A, net_B, image, stride_xy, stride_z, patch_
 
 
 
-def test_single_case_AB(net_A, net_B, image, stride_xy, stride_z, patch_size, num_classes):
+def test_single_case_AB(net_A, net_B, image, stride_xy, stride_z, patch_size, num_classes, return_dict=False):
     image = image[np.newaxis]
     _, dd, ww, hh = image.shape
     print(image.shape)
@@ -299,7 +319,16 @@ def test_single_case_AB(net_A, net_B, image, stride_xy, stride_z, patch_size, nu
                 # print("===",test_patch.size())
                 # <-- [1, 1, Z, Y, X] => [1, 1, X, Y, Z]
                 test_patch = test_patch.transpose(2, 4)
-                y1 = (net_A(test_patch) + net_B(test_patch)) / 2.0 # <--
+                
+                if return_dict:
+                    # For models that return dictionaries, extract seg_logits
+                    output_A = net_A(test_patch)
+                    output_B = net_B(test_patch)
+                    y1 = (output_A['seg_logits'] + output_B['seg_logits']) / 2.0
+                else:
+                    # For models that return tensors directly
+                    y1 = (net_A(test_patch) + net_B(test_patch)) / 2.0
+                
                 y = F.softmax(y1, dim=1) # <--
                 y = y.cpu().data.numpy()
                 y = y[0, ...]
@@ -313,6 +342,3 @@ def test_single_case_AB(net_A, net_B, image, stride_xy, stride_z, patch_size, nu
     score_map = score_map.transpose(0, 3, 2, 1) # => [X, Y, Z]
     label_map = np.argmax(score_map, axis=0)
     return label_map, score_map
-
-
-

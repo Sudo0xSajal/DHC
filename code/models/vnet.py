@@ -2,6 +2,26 @@ import torch
 from torch import nn
 
 
+#    ADD: a tiny per-class noise estimator   
+class NoiseHead2x3D(nn.Module):
+    """
+    Two-layer 3D CNN that predicts per-class voxelwise noise in [0,1].
+    Input : [B, C_in, D, H, W] (C_in = channels of x9)
+    Output: [B, n_classes, D, H, W]
+    """
+    def __init__(self, in_ch, n_classes, hidden=16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(in_ch, hidden, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(hidden, n_classes, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class ConvBlock(nn.Module):
     def __init__(self, n_stages, n_filters_in, n_filters_out, normalization='none'):
         super(ConvBlock, self).__init__()
@@ -117,6 +137,9 @@ class VNet(nn.Module):
         self.block_nine = ConvBlock(1, n_filters, n_filters, normalization=normalization)
         self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
 
+        #    ADD: noise head attached to x9 (last decoder feature)   
+        self.noise_head = NoiseHead2x3D(in_ch=n_filters, n_classes=n_classes, hidden=16)
+
         self.dropout = nn.Dropout3d(p=0.5, inplace=False)
 
     def encoder(self, input):
@@ -162,20 +185,40 @@ class VNet(nn.Module):
             x9 = self.dropout(x9)
         
         out = self.out_conv(x9)
-        return out
+        #    MODIFIED: return both out and x9   
+        return out, x9  # <<< was: return out
 
-    def forward(self, image, turnoff_drop=False):
+    #    MODIFIED: Forward optionally return noise & features, preserving old behavior   
+    def forward(self, image, turnoff_drop=False, return_dict=True):
+        """
+        If return_dict=True:
+        returns {'seg_logits','seg_probs','noise','feat'} (feat = x9)
+        Else:
+        returns seg_logits (backward compatible)
+        """
         if turnoff_drop:
             has_dropout = self.has_dropout
             self.has_dropout = False
         
         features = self.encoder(image)
-        out = self.decoder(features)
+        out, x9 = self.decoder(features)  # <<< now returns both
         
         if turnoff_drop:
             self.has_dropout = has_dropout
-        
-        return out
+
+        if not return_dict:
+            return out  # keep legacy behavior
+
+        seg_logits = out
+        seg_probs = torch.softmax(seg_logits, dim=1)
+        noise = self.noise_head(x9)  # <<< NEW: noise map on x9
+
+        return {
+            'seg_logits': seg_logits,
+            'seg_probs': seg_probs,
+            'noise': noise,
+            'feat': x9
+        }
 
 
 class VNet4SSNet(nn.Module):
@@ -209,6 +252,9 @@ class VNet4SSNet(nn.Module):
 
         self.block_nine = ConvBlock(1, n_filters, n_filters, normalization=normalization)
         self.out_conv = nn.Conv3d(n_filters, n_classes, 1, padding=0)
+
+        #    ADD: noise head for VNet4SSNet as well   
+        self.noise_head = NoiseHead2x3D(in_ch=n_filters, n_classes=n_classes, hidden=16)
 
         dim_in = n_filters
         feat_dim = n_filters * 2
@@ -290,14 +336,14 @@ class VNet4SSNet(nn.Module):
         out = self.out_conv(x9)
         return out, x9
 
-
     def forward_projection_head(self, features):
         return self.projection_head(features)
 
     def forward_prediction_head(self, features):
         return self.prediction_head(features)
 
-    def forward(self, image, turnoff_drop=False):
+    #    MODIFIED: VNet4SSNet forward with noise head support   
+    def forward(self, image, turnoff_drop=False, return_dict=True):
         if turnoff_drop:
             has_dropout = self.has_dropout
             self.has_dropout = False
@@ -311,4 +357,17 @@ class VNet4SSNet(nn.Module):
         if not self.training:
             return out
 
-        return out, embedding
+        if not return_dict:
+            return out, embedding
+
+        #    ADD: noise head for VNet4SSNet during training   
+        seg_logits = out
+        seg_probs = torch.softmax(seg_logits, dim=1)
+        noise = self.noise_head(embedding)  # Use embedding (x9) for noise prediction
+
+        return {
+            'seg_logits': seg_logits,
+            'seg_probs': seg_probs,
+            'noise': noise,
+            'feat': embedding
+        }

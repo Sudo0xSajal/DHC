@@ -22,6 +22,12 @@ parser.add_argument('-g', '--gpu', type=str, default='0')
 parser.add_argument('-w', '--cps_w', type=float, default=1)
 parser.add_argument('-r', '--cps_rampup', action='store_true', default=True) # <--
 parser.add_argument('-cr', '--consistency_rampup', type=float, default=None)
+#   ADD: noise parameters  
+parser.add_argument('--alpha_noise', type=float, default=0.7)
+parser.add_argument('--alpha_rampup', type=int, default=100)
+parser.add_argument('--w_sup_noise', type=float, default=0.3)
+parser.add_argument('--w_u_noise', type=float, default=0.2)
+parser.add_argument('--w_noise_cons', type=float, default=0.1)
 args = parser.parse_args()
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
 
@@ -36,11 +42,12 @@ from torch.cuda.amp import GradScaler, autocast
 from models.vnet import VNet
 from utils import EMA, maybe_mkdir, get_lr, fetch_data, seed_worker, poly_lr, print_func, kaiming_normal_init_weight
 from utils.loss import DC_and_CE_loss, RobustCrossEntropyLoss, SoftDiceLoss
+from utils.noise_loss import NoiseLosses
+from utils.noise_utils import cross_correct_logits, refined_pseudo_from
 from data.transforms import RandomCrop, CenterCrop, ToTensor, RandomFlip_LR, RandomFlip_UD
 from data.data_loaders import Synapse_AMOS
 from utils.config import Config
 config = Config(args.task)
-
 
 
 def sigmoid_rampup(current, rampup_length):
@@ -62,6 +69,12 @@ def get_current_consistency_weight(epoch):
     else:
         return args.cps_w
 
+
+#   ADD: alpha rampup helper  
+def get_alpha(epoch):
+    if args.alpha_rampup and args.alpha_rampup > 0:
+        return args.alpha_noise * sigmoid_rampup(epoch, args.alpha_rampup)
+    return args.alpha_noise
 
 
 def make_loss_function(name, weight=None):
@@ -185,7 +198,7 @@ class DiffDW:
         self.cls_learn = torch.zeros(num_cls).float().cuda()
         self.cls_unlearn = torch.zeros(num_cls).float().cuda()
         self.num_cls = num_cls
-        self.dice_weight = torch.ones(num_cls).float().cuda()
+        self.dice_weight = torch.zeros(num_cls).float().cuda()
         self.accumulate_iters = accumulate_iters
 
     def init_weights(self):
@@ -257,6 +270,8 @@ if __name__ == '__main__':
     model_A = kaiming_normal_init_weight(model_A)
     model_B = kaiming_normal_init_weight(model_B)
 
+    #   ADD: instantiate noise losses  
+    noise_losses = NoiseLosses()
 
     # make loss function
     diffdw = DiffDW(config.num_cls, accumulate_iters=50)
@@ -281,6 +296,10 @@ if __name__ == '__main__':
         loss_list = []
         loss_cps_list = []
         loss_sup_list = []
+        #   ADD: noise loss lists  
+        loss_sup_noise_list = []
+        loss_u_dis_list = []
+        loss_cons_list = []
 
         model_A.train()
         model_B.train()
@@ -295,43 +314,61 @@ if __name__ == '__main__':
 
             if args.mixed_precision:
                 with autocast():
-                    output_A = model_A(image)
-                    output_B = model_B(image)
+                    #   MODIFIED: model now returns dict  
+                    outA = model_A(image)  # dict: seg_logits, seg_probs, noise, feat
+                    outB = model_B(image)
                     del image
 
-                    # sup (ce + dice)
-                    output_A_l, output_A_u = output_A[:tmp_bs, ...], output_A[tmp_bs:, ...]
-                    output_B_l, output_B_u = output_B[:tmp_bs, ...], output_B[tmp_bs:, ...]
+                    #   REPLACED: split labeled / unlabeled with dict access  
+                    A_l = {k: v[:tmp_bs] for k, v in outA.items()}
+                    A_u = {k: v[tmp_bs:] for k, v in outA.items()}
+                    B_l = {k: v[:tmp_bs] for k, v in outB.items()}
+                    B_u = {k: v[tmp_bs:] for k, v in outB.items()}
 
+                    # supervised segmentation (unchanged)
+                    loss_sup = loss_func_A(A_l['seg_logits'], label_l) + loss_func_B(B_l['seg_logits'], label_l)
 
-                    # cps (ce only)
-                    max_A = torch.argmax(output_A.detach(), dim=1, keepdim=True).long()
-                    max_B = torch.argmax(output_B.detach(), dim=1, keepdim=True).long()
+                    #   ADD: noise losses  
+                    L_sup_noise, L_u_dis, L_cons = noise_losses(
+                        pA_l=A_l['seg_probs'], pB_l=B_l['seg_probs'], y_l=label_l,
+                        nA_l=A_l['noise'], nB_l=B_l['noise'],
+                        pA_u=A_u['seg_probs'], pB_u=B_u['seg_probs'],
+                        nA_u=A_u['noise'], nB_u=B_u['noise'],
+                        w_l=args.w_sup_noise, w_u=args.w_u_noise, w_cons=args.w_noise_cons
+                    )
 
+                    #   ADD: cross-correction on *unlabeled* logits  
+                    alpha = get_alpha(epoch_num)
+                    A_logits_ref_u = cross_correct_logits(A_u['seg_logits'], B_u['noise'], alpha)
+                    B_logits_ref_u = cross_correct_logits(B_u['seg_logits'], A_u['noise'], alpha)
 
-                    weight_A = diffdw.cal_weights(output_A_l.detach(), label_l.detach())
-                    weight_B = distdw.get_ema_weights(output_B_u.detach())
+                    #   ADD: build refined logits for full batch  
+                    A_logits_ref = torch.cat([A_l['seg_logits'], A_logits_ref_u], dim=0)
+                    B_logits_ref = torch.cat([B_l['seg_logits'], B_logits_ref_u], dim=0)
 
+                    #   ADD: refined pseudo-labels  
+                    max_A = refined_pseudo_from(B_logits_ref)  # target for A
+                    max_B = refined_pseudo_from(A_logits_ref)  # target for B
 
+                    weight_A = diffdw.cal_weights(A_l['seg_logits'].detach(), label_l.detach())
+                    weight_B = distdw.get_ema_weights(B_u['seg_probs'].detach())
 
                     loss_func_A.update_weight(weight_A)
                     loss_func_B.update_weight(weight_B)
                     cps_loss_func_A.update_weight(weight_A)
                     cps_loss_func_B.update_weight(weight_B)
 
-
-                    loss_sup = loss_func_A(output_A_l, label_l) + loss_func_B(output_B_l, label_l)
-                    loss_cps = cps_loss_func_A(output_A, max_B) + cps_loss_func_B(output_B, max_A)
-                    loss = loss_sup + cps_w * loss_cps
-
-
+                    #   MODIFIED: CPS with refined pseudo-labels  
+                    loss_cps = cps_loss_func_A(outA['seg_logits'], max_A) + cps_loss_func_B(outB['seg_logits'], max_B)
+                    
+                    #   MODIFIED: total loss with noise losses  
+                    loss = loss_sup + cps_w * loss_cps + (L_sup_noise + L_u_dis + L_cons)
 
                 # backward passes should not be under autocast.
                 amp_grad_scaler.scale(loss).backward()
                 amp_grad_scaler.step(optimizer_A)
                 amp_grad_scaler.step(optimizer_B)
                 amp_grad_scaler.update()
-                # if epoch_num>0:
 
             else:
                 raise NotImplementedError
@@ -339,16 +376,32 @@ if __name__ == '__main__':
             loss_list.append(loss.item())
             loss_sup_list.append(loss_sup.item())
             loss_cps_list.append(loss_cps.item())
+            #   ADD: store noise losses  
+            loss_sup_noise_list.append(L_sup_noise.item())
+            loss_u_dis_list.append(L_u_dis.item())
+            loss_cons_list.append(L_cons.item())
 
         writer.add_scalar('lr', get_lr(optimizer_A), epoch_num)
         writer.add_scalar('cps_w', cps_w, epoch_num)
         writer.add_scalar('loss/loss', np.mean(loss_list), epoch_num)
         writer.add_scalar('loss/sup', np.mean(loss_sup_list), epoch_num)
         writer.add_scalar('loss/cps', np.mean(loss_cps_list), epoch_num)
+        #   ADD: noise loss logging  
+        writer.add_scalar('loss/sup_noise', np.mean(loss_sup_noise_list), epoch_num)
+        writer.add_scalar('loss/u_disagree', np.mean(loss_u_dis_list), epoch_num)
+        writer.add_scalar('loss/noise_cons', np.mean(loss_cons_list), epoch_num)
+        writer.add_scalar('noise/alpha', alpha, epoch_num)
+        
+        #   ADD: optional noise statistics  
+        with torch.no_grad():
+            # You can add noise mean statistics here if desired
+            pass
+            
         # print(dict(zip([i for i in range(config.num_cls)] ,print_func(weight_A))))
         writer.add_scalars('class_weights/A', dict(zip([str(i) for i in range(config.num_cls)] ,print_func(weight_A))), epoch_num)
         writer.add_scalars('class_weights/B', dict(zip([str(i) for i in range(config.num_cls)] ,print_func(weight_B))), epoch_num)
         logging.info(f'epoch {epoch_num} : loss : {np.mean(loss_list)}')
+        logging.info(f'     noise_losses: sup{np.mean(loss_sup_noise_list):.4f}, dis{np.mean(loss_u_dis_list):.4f}, cons{np.mean(loss_cons_list):.4f}')
         # logging.info(f'     cps_w: {cps_w}')
         # if epoch_num>0:
         logging.info(f"     Class Weights A: {print_func(weight_A)}, lr: {get_lr(optimizer_A)}")
@@ -371,7 +424,10 @@ if __name__ == '__main__':
             for batch in tqdm(eval_loader):
                 with torch.no_grad():
                     image, gt = fetch_data(batch)
-                    output = (model_A(image) + model_B(image))/2.0
+                    #   MODIFIED: evaluation uses return_dict=False  
+                    output_A = model_A(image, return_dict=False)
+                    output_B = model_B(image, return_dict=False)
+                    output = (output_A + output_B) / 2.0
                     # output = model_B(image)
                     del image
 
