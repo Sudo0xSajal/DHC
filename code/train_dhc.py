@@ -359,8 +359,8 @@ if __name__ == '__main__':
                     cps_loss_func_B.update_weight(weight_B)
 
                     #   MODIFIED: CPS with refined pseudo-labels  
-                    loss_cps = cps_loss_func_A(outA['seg_logits'], max_A) + cps_loss_func_B(outB['seg_logits'], max_B)
-                    
+                    # loss_cps = cps_loss_func_A(outA['seg_logits'], max_A) + cps_loss_func_B(outB['seg_logits'], max_B)
+                    loss_cps = cps_loss_func_A(A_logits_ref, max_A) + cps_loss_func_B(B_logits_ref, max_B)
                     #   MODIFIED: total loss with noise losses  
                     loss = loss_sup + cps_w * loss_cps + (L_sup_noise + L_u_dis + L_cons)
 
