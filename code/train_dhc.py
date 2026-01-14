@@ -71,10 +71,14 @@ def get_current_consistency_weight(epoch):
 
 
 #   ADD: alpha rampup helper  
-def get_alpha(epoch):
-    if args.alpha_rampup and args.alpha_rampup > 0:
-        return args.alpha_noise * sigmoid_rampup(epoch, args.alpha_rampup)
-    return args.alpha_noise
+# def get_alpha(epoch):
+#     if args.alpha_rampup and args.alpha_rampup > 0:
+#         return args.alpha_noise * sigmoid_rampup(epoch, args.alpha_rampup)
+#     return args.alpha_noise
+def get_alpha(epoch, delay=200): 
+    if epoch < delay:
+        return 0.0 # No cancellation during warmup 
+    return args.alpha_noise * sigmoid_rampup(epoch - delay, args.alpha_rampup)
 
 
 def make_loss_function(name, weight=None):
@@ -461,8 +465,8 @@ if __name__ == '__main__':
                 }, save_path)
                 logging.info(f'saving best model to {save_path}')
             logging.info(f'\t best eval dice is {best_eval} in epoch {best_epoch}')
-            if epoch_num - best_epoch == config.early_stop_patience:
-                logging.info(f'Early stop.')
-                break
+            # if epoch_num - best_epoch == config.early_stop_patience:
+            #     logging.info(f'Early stop.')
+            #     break
 
     writer.close()
