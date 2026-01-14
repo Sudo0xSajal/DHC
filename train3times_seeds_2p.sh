@@ -14,7 +14,7 @@ done
 echo $method
 echo $cuda
 
-epoch=200
+epoch=500
 echo $epoch
 
 labeled_data="labeled_2p"
